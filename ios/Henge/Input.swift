@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import GameController
 
 /// Types into the Mac. Two invisible views take turns holding the keyboard: one that asks for the
 /// on-screen keyboard, with a row of the Mac's own keys above it, and one that doesn't, so that a
@@ -19,22 +20,37 @@ struct KeyboardCatcher: UIViewRepresentable {
         let listener = KeyListener()
         let typer = CatcherView()
         var typing = false
-        private var hiding: NSObjectProtocol?
+        private var observers: [NSObjectProtocol] = []
+        private var retake: Timer?
 
         override init(frame: CGRect) {
             super.init(frame: frame)
             addSubview(listener)
             addSubview(typer)
-            hiding = NotificationCenter.default.addObserver(forName: UIResponder.keyboardWillHideNotification,
-                                                            object: nil, queue: .main) { [weak self] _ in
+            let centre = NotificationCenter.default
+            observers.append(centre.addObserver(forName: UIResponder.keyboardWillHideNotification,
+                                                object: nil, queue: .main) { [weak self] _ in
                 self?.keyboardHid()
+            })
+            // A keyboard connected mid-session, or the app back in front, finds the listener holding the keyboard.
+            for name in [Notification.Name.GCKeyboardDidConnect, UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification] {
+                observers.append(centre.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.takeKeyboard()
+                })
             }
+            // Lost to anything else (a tap on SwiftUI's views, a closed sheet), the keyboard is taken back at once:
+            // SwiftUI calls updateUIView only when typing changes, so a hardware keyboard otherwise went dead
+            // until the on-screen keyboard was opened.
+            let lost: () -> Void = { [weak self] in DispatchQueue.main.async { self?.takeKeyboard() } }
+            listener.onResign = lost
+            typer.onResign = lost
         }
 
         required init?(coder: NSCoder) { fatalError("made in code") }
 
         deinit {
-            if let hiding { NotificationCenter.default.removeObserver(hiding) }
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+            retake?.invalidate()
         }
 
         /// iPadOS's own hide-keyboard key closes the keyboard without asking the app, which then went on
@@ -42,15 +58,22 @@ struct KeyboardCatcher: UIViewRepresentable {
         /// A sheet taking the keyboard isn't that: it is handed back when the sheet closes.
         private func keyboardHid() {
             guard typing, let window, window.rootViewController?.presentedViewController == nil else { return }
+            typing = false // before SwiftUI says so, or taking the keyboard back would reopen it
             typer.onHide()
         }
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
+            retake?.invalidate()
+            retake = nil
+            guard window != nil else { return }
             takeKeyboard()
+            // Nothing tells the view when a sheet or dialog has gone: look twice a second (cheap when it already has it).
+            retake = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.takeKeyboard() }
+            retake?.tolerance = 0.2
         }
 
-        /// Called often, which also takes the keyboard back after a sheet has had it.
+        /// Takes the keyboard for whichever view should have it, unless a sheet has it.
         func takeKeyboard() {
             guard let window, window.rootViewController?.presentedViewController == nil else { return }
             let holder: UIView = typing ? typer : listener
@@ -60,7 +83,14 @@ struct KeyboardCatcher: UIViewRepresentable {
 
     /// Whichever view holds the keyboard hears a hardware keyboard's keys here.
     class KeyListener: UIView {
+        var onResign: () -> Void = {}
         override var canBecomeFirstResponder: Bool { true }
+
+        override func resignFirstResponder() -> Bool {
+            let resigned = super.resignFirstResponder()
+            if resigned { onResign() }
+            return resigned
+        }
         /// Three fingers belong to the session (they show its controls), not to iPadOS's undo/copy/paste bar.
         override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
